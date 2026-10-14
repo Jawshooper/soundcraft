@@ -1,8 +1,11 @@
 //! Loopback JSON-lines control server: one request per line, one reply per line.
 //! This is the transport the MCP server (`soundcraft-cli mcp --connect PORT`) wraps.
 //!
-//! Lines are bounded ([`MAX_LINE`]): a longer one is refused and the connection closed, without
-//! buffering the rest. So is the number of connections served at once ([`MAX_CONNECTIONS`]).
+//! A line that is not a JSON object with a string `method` (the request line of a browser's
+//! cross-origin `fetch`, a stray `nc`, junk) gets one error reply and the connection is closed, so
+//! nothing after it is executed. Lines are bounded ([`MAX_LINE`]): a longer one is refused and the
+//! connection closed, without buffering the rest. So is the number of connections served at once
+//! ([`MAX_CONNECTIONS`]).
 
 use serde_json::{Value, json};
 use soundcraft_ui_egui::ControlRequest;
@@ -113,11 +116,8 @@ fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context) {
         if line.trim().is_empty() {
             continue;
         }
-        let reply = match serde_json::from_str::<Value>(line) {
-            Ok(msg) => {
-                let id = msg.get("id").cloned().unwrap_or(Value::Null);
-                let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
-                let params = msg.get("params").cloned().unwrap_or(json!({}));
+        let reply = match parse_request(line) {
+            Ok((id, method, params)) => {
                 let (req, rrx) = ControlRequest::new(method, params);
                 if tx.send(req).is_err() {
                     break;
@@ -129,12 +129,30 @@ fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context) {
                 }
                 r
             }
-            Err(e) => json!({"ok": false, "error": format!("bad JSON: {e}")}),
+            Err(e) => {
+                // Not a request (e.g. the request line of a browser's cross-origin `fetch`): close the
+                // connection, so nothing after it (such as a JSON body) is executed.
+                let _ = writeln!(out, "{}", json!({"ok": false, "error": e}));
+                break;
+            }
         };
         if writeln!(out, "{reply}").is_err() {
             break;
         }
     }
+}
+
+/// A line's `(id, method, params)`, or why it isn't a request: a JSON object with a string `method`.
+fn parse_request(line: &str) -> Result<(Value, String, Value), String> {
+    let msg = serde_json::from_str::<Value>(line)
+        .map_err(|e| format!("bad JSON ({e}); expected one JSON request object per line; closing the connection"))?;
+    let Some(obj) = msg.as_object() else {
+        return Err("not a control request (expected a JSON object); closing the connection".into());
+    };
+    let Some(method) = obj.get("method").and_then(Value::as_str) else {
+        return Err("not a control request (missing string `method`); closing the connection".into());
+    };
+    Ok((obj.get("id").cloned().unwrap_or(Value::Null), method.to_string(), obj.get("params").cloned().unwrap_or(json!({}))))
 }
 
 #[cfg(test)]
@@ -197,6 +215,36 @@ mod tests {
             r.read_line(&mut line).unwrap();
             let v: Value = serde_json::from_str(&line).unwrap();
             assert_eq!((v["id"].as_i64(), v["method"].as_str()), (Some(id), Some(method)), "{line}");
+        }
+    }
+
+    /// Everything the server sends back until it closes the connection.
+    fn replies_until_closed(input: &[u8]) -> Vec<Value> {
+        let addr = serve_echo();
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(input).unwrap();
+        BufReader::new(c).lines().map(|l| serde_json::from_str(&l.unwrap()).unwrap()).collect()
+    }
+
+    #[test]
+    fn http_request_closes_before_the_body_runs() {
+        // A browser's cross-origin `fetch` POST (text/plain, no preflight): the request line is
+        // rejected and the connection closed, so the JSON body is never executed.
+        let http = b"POST / HTTP/1.1\r\nHost: 127.0.0.1:7801\r\nOrigin: https://attacker.example\r\n\
+            Content-Type: text/plain\r\n\r\n{\"id\":1,\"method\":\"engine.execute\",\"params\":{\"command\":\"app.quit\"}}\n";
+        let r = replies_until_closed(http);
+        assert_eq!(r.len(), 1, "one error, then closed; nothing ran: {r:?}");
+        assert_eq!(r[0]["ok"], false);
+        assert!(r[0]["error"].as_str().unwrap().contains("closing the connection"), "{r:?}");
+    }
+
+    #[test]
+    fn non_request_lines_close_the_connection() {
+        for junk in [&b"[1,2]\n{\"method\":\"a\"}\n"[..], b"{\"id\":1}\n{\"method\":\"a\"}\n", b"{\"method\":5}\n{\"method\":\"a\"}\n"] {
+            let r = replies_until_closed(junk);
+            assert_eq!(r.len(), 1, "{r:?}");
+            assert_eq!(r[0]["ok"], false, "{r:?}");
         }
     }
 
